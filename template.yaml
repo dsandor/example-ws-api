@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+
+########## API Gateway WebSocket Resources ############
+
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: Api
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.action
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: v1
+      Description: Version 1 'stage'
+      DeploymentId: !Ref Deployment
+      ApiId: !Ref Api
+
+  Deployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ConnectRoute
+    Properties:
+      ApiId: !Ref Api
+
+  # Role for APIGW Logging
+  ApiGatewayLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Allows APIGateway to write to cloudwatch logs.
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+        Version: "2012-10-17"
+      MaxSessionDuration: 3600
+      Path: '/'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayLoggingRoleAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayLoggingRole.Arn
+
+
+########## Authorizer Function and APIGW Config ############
+
+  Auth:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      Name: Websocket-Authorizer
+      ApiId: !Ref Api
+      AuthorizerType: REQUEST
+      AuthorizerUri:
+        Fn::Sub:
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthFunction.Arn}/invocations
+      IdentitySource:
+        - "route.request.querystring.token"
+
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: auth/
+      Handler: bootstrap       # note, this is the name of the executable output from the Makefile.
+      Runtime: provided.al2
+      Architectures: [ arm64 ]
+      Policies:
+        - AWSLambdaBasicExecutionRole
+    Metadata:
+      BuildMethod: makefile
+
+  AuthorizerFunctionPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - Api
+      - AuthFunction
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AuthFunction
+      Principal: apigateway.amazonaws.com
+
+########## Connect Route ($connect) Function and APIGW Config ############
+
+  ConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: connect/
+      Handler: bootstrap       # note, this is the name of the executable output from the Makefile.
+      Runtime: provided.al2
+      Architectures: [ arm64 ]
+      Policies:
+        - AWSLambdaBasicExecutionRole
+    Metadata:
+      BuildMethod: makefile
+
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "$connect"
+      AuthorizationType: CUSTOM
+      OperationName: connect
+      AuthorizerId: !Ref Auth
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref ConnectLambdaIntegration
+
+  ConnectFunctionPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - Api
+      - ConnectFunction
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ConnectFunction
+      Principal: apigateway.amazonaws.com
+
+  ConnectLambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      Description: Connect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::Sub:
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConnectFunction.Arn}/invocations
+
+########## Default Route ($default) Function and APIGW Config ############
+
+  DefaultFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: default/
+      Handler: bootstrap       # note, this is the name of the executable output from the Makefile.
+      Runtime: provided.al2
+      Architectures: [ arm64 ]
+      Policies:
+        - AWSLambdaBasicExecutionRole
+    Metadata:
+      BuildMethod: makefile
+
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "$default"
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref DefaultLambdaIntegration
+ 
+  DefaultFunctionPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - Api
+      - DefaultFunction
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DefaultFunction
+      Principal: apigateway.amazonaws.com
+
+  DefaultLambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      Description: Default Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::Sub:
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DefaultFunction.Arn}/invocations
+
+  DefaultRouteResponse:
+    Type: AWS::ApiGatewayV2::RouteResponse
+    Properties:
+      RouteId: !Ref DefaultRoute
+      ApiId: !Ref Api
+      RouteResponseKey: "$default"
+
+  DefaultIntegrationResponse:
+    Type: AWS::ApiGatewayV2::IntegrationResponse
+    Properties:
+      IntegrationId: !Ref DefaultLambdaIntegration
+      IntegrationResponseKey: "$default"
+      ApiId: !Ref Api
+
+
